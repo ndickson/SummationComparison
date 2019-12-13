@@ -162,27 +162,33 @@ struct SimpleNewState : TupleSumState<T,2> {
 
 template<typename T>
 struct PairwiseState {
-	std::vector<T> state;
+	// MAX_POWER of 48 corresponds with a count of over 281 trillion.
+	// NOTE: We can't use std::vector here, because we need a fixed-size
+	// state for saving to files.
+	constexpr static size_t MAX_POWER = 48;
+	T state[MAX_POWER];
 	uint64 count;
 
 	PairwiseState() {
 		reset();
 	}
 	void reset() {
-		state.clear();
+		for (size_t i = 0; i < MAX_POWER; ++i) {
+			state[i] = 0;
+		}
 		count = 0;
 	}
 	INLINE void add(T item) {
-		size_t mask = 1;
+		uint64 mask = 1;
 		size_t bit = 0;
-		while (mask & count) {
+		while ((mask & count) && (bit < MAX_POWER)) {
 			item += state[bit];
 			state[bit] = 0; // Clear just in case
 			mask += mask;
 			++bit;
 		}
-		if (bit >= state.size()) {
-			state.push_back(item);
+		if (bit >= MAX_POWER) {
+			state[MAX_POWER-1] = item;
 		}
 		else {
 			state[bit] = item;
@@ -195,10 +201,15 @@ struct PairwiseState {
 	big_float::BigFloat<FN> asBigFloat() const {
 		// Add from smallest to largest
 		big_float::BigFloat<FN> outSum = big_float::constants::zero<FN>;
-		for (size_t i = 0; i < state.size(); ++i) {
-			if (count & (1ULL<<i)) {
+		uint64 mask = count;
+		for (size_t i = 0; i < MAX_POWER; ++i) {
+			if (mask & 1) {
 				outSum += big_float::BigFloat<FN>(double(state[i]));
 			}
+			mask >>= 1;
+		}
+		if ((count >= (1ULL<<MAX_POWER)) && !(mask & (1ULL<<(MAX_POWER-1)))) {
+			outSum += big_float::BigFloat<FN>(double(state[MAX_POWER-1]));
 		}
 		return outSum;
 	}
@@ -222,11 +233,12 @@ struct BlockState : TupleSumState<T,2> {
 	}
 	INLINE void add(T item) {
 		sum[1] += item;
+		// Increment first, so that we only send the value up at the *end* of a block.
+		++count;
 		if (!(count & blockMask)) {
 			sum[0] += sum[1];
 			sum[1] = 0;
 		}
-		++count;
 	}
 };
 
