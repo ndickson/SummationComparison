@@ -261,6 +261,10 @@ struct BigFloatState {
 	big_float::BigFloat<FN> asBigFloat() const {
 		return big_float::BigFloat<FN>(sum);
 	}
+
+	void roundToNumBits(size_t numMantissaBits) {
+		sum.roundToNumBits(numMantissaBits);
+	}
 };
 
 template<typename SUM_T>
@@ -404,6 +408,7 @@ struct SequenceInfo {
 	const char* methodDataTypeName;
 	const char* itemDataTypeName;
 	const char* distributionName;
+	size_t numBits;
 };
 
 static void makeFilename(
@@ -792,6 +797,13 @@ bool sumTaskWrapper1(
 			if (task == 0) {
 				for (uint64 itemi = startItem; itemi < ITEMS_PER_BLOCK; ++itemi) {
 					sumSingle(state, items[itemi]);
+
+					if constexpr (std::is_same<STATE_T,BigFloatState<10>>::value) {
+						if (sequenceInfo.numBits != 0) {
+							state.roundToNumBits(sequenceInfo.numBits);
+						}
+					}
+
 					++sequenceOffset;
 					if (shouldReportAfter(sequenceOffset) || ((itemi == ITEMS_PER_BLOCK-1) && (blocki == BLOCKS_PER_TASK-1))) {
 						size_t numBytesWritten = WriteFile(sumFile, &state, sizeof(state));
@@ -821,7 +833,14 @@ bool sumTaskWrapper1(
 				// far enough along in the sequence.
 				for (uint64 itemi = startItem; itemi < ITEMS_PER_BLOCK; ++itemi) {
 					sumSingle(state, items[itemi]);
+
+					if constexpr (std::is_same<STATE_T,BigFloatState<10>>::value) {
+						if (sequenceInfo.numBits != 0) {
+							state.roundToNumBits(sequenceInfo.numBits);
+						}
+					}
 				}
+
 				sequenceOffset += ITEMS_PER_BLOCK;
 				if (shouldReportAfter(sequenceOffset) || (blocki == BLOCKS_PER_TASK-1)) {
 					size_t numBytesWritten = WriteFile(sumFile, &state, sizeof(state));
@@ -925,8 +944,26 @@ void testFileEntryOffsets() {
 	}
 }
 
+#if 0
+void testRounding() {
+	BigFloat<10> v(7.0);
+	v.roundToNumBits(2);
+	double d = double(v);
+	printf("%f ", d);
+	fflush(stdout);
+	v = BigFloat<10>(5.0);
+	v.roundToNumBits(2);
+	d = double(v);
+	printf("%f ", d);
+	fflush(stdout);
+}
+#endif
+
 
 int main(int argc,char** argv) {
+
+	//testRounding();
+	//return 0;
 
 	//testFileEntryOffsets();
 	//return 0;
@@ -1017,6 +1054,7 @@ int main(int argc,char** argv) {
 		NEW_SIMPLE,
 		PAIRWISE,
 		BLOCK,
+		BITS,
 		BIGFLOAT10
 	};
 	// FIXME: Figure out what the distribution is for contributions proportional to 1/d^2 in unit disk!!!
@@ -1037,6 +1075,7 @@ int main(int argc,char** argv) {
 	};
 
 	Method method;
+	size_t numBits = 0;
 	if (strcmp(summationMethodName,"OneNumber") == 0) {
 		method = Method::ONE_NUMBER;
 	}
@@ -1060,6 +1099,30 @@ int main(int argc,char** argv) {
 	}
 	else if (strcmp(summationMethodName,"Block") == 0) {
 		method = Method::BLOCK;
+	}
+	else if (summationMethodName[0] >= '0' && summationMethodName[0] <= '9') {
+		numBits = (summationMethodName[0]-'0');
+		size_t i;
+		for (i = 1; summationMethodName[i] >= '0' && summationMethodName[i] <= '9'; ++i) {
+			numBits *= 10;
+			numBits += (summationMethodName[i]-'0');
+		}
+		if (summationMethodName[i] != 'b' || summationMethodName[i+1] != 'i' || summationMethodName[i+2] != 't' || summationMethodName[i+3] != 0) {
+			printf("Unsupported summation method \"%s\"!", summationMethodName);
+			fflush(stdout);
+			return -1;
+		}
+		if (numBits == 0) {
+			printf("Unsupported summation method \"%s\" (zero bits doesn't make sense)!", summationMethodName);
+			fflush(stdout);
+			return -1;
+		}
+		if (numBits > BigFloat<10>::DATA_TYPE_BITS*10 + 1) {
+			printf("Unsupported summation method \"%s\" (too many bits to use a BigFloat<10>)!", summationMethodName);
+			fflush(stdout);
+			return -1;
+		}
+		method = Method::BITS;
 	}
 	else if (strcmp(summationMethodName,"BigFloat10") == 0) {
 		method = Method::BIGFLOAT10;
@@ -1210,6 +1273,7 @@ int main(int argc,char** argv) {
 	sequenceInfo.methodDataTypeName = methodDataTypeName;
 	sequenceInfo.itemDataTypeName = itemDataTypeName;
 	sequenceInfo.distributionName = distributionName;
+	sequenceInfo.numBits = numBits;
 
 	bool success = false;
 	if (methodDataType == DataType::FLOAT) {
@@ -1246,6 +1310,7 @@ int main(int argc,char** argv) {
 				success = sumTaskWrapper0<BlockState<float>>(itemDataType, inverseCDF, sequenceInfo);
 				break;
 			}
+			case Method::BITS:
 			case Method::BIGFLOAT10: {
 				success = sumTaskWrapper0<BigFloatState<10>>(itemDataType, inverseCDF, sequenceInfo);
 				break;
@@ -1286,6 +1351,7 @@ int main(int argc,char** argv) {
 				success = sumTaskWrapper0<BlockState<double>>(itemDataType, inverseCDF, sequenceInfo);
 				break;
 			}
+			case Method::BITS:
 			case Method::BIGFLOAT10: {
 				success = sumTaskWrapper0<BigFloatState<10>>(itemDataType, inverseCDF, sequenceInfo);
 				break;
