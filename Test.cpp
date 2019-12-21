@@ -6,10 +6,13 @@
 #include <math/KahanSum.h>
 #include <text/NumberText.h>
 #include <BigFloat.h>
+
 #include <algorithm>
+#include <atomic>
 #include <functional>
 #include <memory>
 #include <string.h>
+#include <thread>
 #include <vector>
 
 using namespace OUTER_NAMESPACE;
@@ -30,7 +33,43 @@ constexpr uint64 ITEMS_PER_TASK = (uint64(1)<<LOG2_ITEMS_PER_TASK);
 constexpr uint64 NUM_RESULTS_BEFORE_1_RESULT_PER_TASK = ALL_RESULTS_THRESHOLD + RESULTS_PER_POWER_OF_2*(LOG2_ITEMS_PER_TASK-LOG2_ALL_RESULTS_THRESHOLD+LOG2_ALL_RESULTS_THRESHOLD);
 constexpr uint64 NUM_ITEMS_BEFORE_1_RESULT_PER_TASK = (uint64(1)<<(LOG2_ITEMS_PER_TASK+LOG2_ALL_RESULTS_THRESHOLD));
 constexpr uint64 RANDOM_PER_ITEM = 4;
-constexpr bool KEEP_LOOPING = true;
+
+enum class Method {
+	ONE_NUMBER,
+	KAHAN,
+	NEUMAIER,
+	KLEIN,
+	NEW_FULL,
+	NEW_SIMPLE,
+	PAIRWISE,
+	BLOCK,
+	BITS,
+	BIGFLOAT10
+};
+// FIXME: Figure out what the distribution is for contributions proportional to 1/d^2 in unit disk!!!
+enum class Distribution {
+	UNIFORM,    // [0,1]
+	UNIFORM2,   // [0,1]^2
+	UNIFORM3,   // [0,1]^3
+	UNIFORM4,   // [0,1]^4
+	UNIFORMN2,  // [0,1]^(-2)
+	UNIFORMN3,  // [0,1]^(-3)
+	UNIFORMN4,  // [0,1]^(-4)
+	UNIFORM_PN, // [-1,1]
+	UNIFORM_1_5,// [0,1.5]
+	UNIFORM_PN_1_5,// [-1.5,1.5]
+	NORMAL,     // Normal(0,1)
+	CAUCHY,     // Chauchy(0,1)
+	LOG_NORMAL  // LogNormal(1,1)
+};
+
+enum class DataType {
+	FLOAT,
+	FLOAT2,
+	DOUBLE,
+	DOUBLE2,
+	BIGFLOAT8
+};
 
 template<typename T>
 struct OneNumberState {
@@ -306,14 +345,6 @@ void multiplyDoubleDouble2(double a, double b, SUM_T& result) {
 	result += aHigh*bHigh;
 }
 
-enum class DataType {
-	FLOAT,
-	FLOAT2,
-	DOUBLE,
-	DOUBLE2,
-	BIGFLOAT8
-};
-
 inline void convertToItemType(const BigFloat<8>& sample, float& item) {
 	item = float(sample);
 }
@@ -409,6 +440,11 @@ struct SequenceInfo {
 	const char* itemDataTypeName;
 	const char* distributionName;
 	size_t numBits;
+	uint64 sequenceLimit;
+	DataType methodDataType;
+	Method summationMethod;
+	DataType itemDataType;
+	Distribution distribution;
 };
 
 static void makeFilename(
@@ -673,7 +709,8 @@ static void setupRNG(Random256& rng, uint64 sequenceNumber) {
 template<typename STATE_T,typename ITEM_T>
 bool sumTaskWrapper1(
 	const std::function<void (BigFloat<8>&v)>& inverseCDF,
-	const SequenceInfo& sequenceInfo
+	const SequenceInfo& sequenceInfo,
+	volatile bool& keepRunning
 ) {
 	if (sequenceInfo.sequenceNumber == std::numeric_limits<uint64>::max()) {
 		return analysis<STATE_T,ITEM_T>(sequenceInfo);
@@ -686,7 +723,7 @@ bool sumTaskWrapper1(
 
 	ReadWriteFileHandle sumFile = OpenFileReadWrite(sumFilename.data());
 	if (sumFile.isClear()) {
-		printf("Failed to open sum file \"%s\".", sumFilename.data());
+		printf("Failed to open sum file \"%s\".\n", sumFilename.data());
 		fflush(stdout);
 		return false;
 	}
@@ -696,7 +733,7 @@ bool sumTaskWrapper1(
 
 	ReadWriteFileHandle rngFile = OpenFileReadWrite(rngFilename.data());
 	if (rngFile.isClear()) {
-		printf("Failed to open RNG file \"%s\".", rngFilename.data());
+		printf("Failed to open RNG file \"%s\".\n", rngFilename.data());
 		fflush(stdout);
 		return false;
 	}
@@ -724,14 +761,14 @@ bool sumTaskWrapper1(
 		const uint64 lastValidSumStart = (numValidSumEntries - 1)*sizeof(STATE_T);
 		bool success = SetFileOffset(sumFile, lastValidSumStart);
 		if (!success) {
-			printf("Failed to set the file offset to %llu in the sum file \"%s\".", lastValidSumStart, sumFilename.data());
+			printf("Failed to set the file offset to %llu in the sum file \"%s\".\n", lastValidSumStart, sumFilename.data());
 			fflush(stdout);
 			return false;
 		}
 
 		size_t numBytesRead = ReadFile(sumFile, &state, sizeof(state));
 		if (numBytesRead != sizeof(state)) {
-			printf("Failed to read the 2nd-last state from the sum file \"%s\".", sumFilename.data());
+			printf("Failed to read the 2nd-last state from the sum file \"%s\".\n", sumFilename.data());
 			fflush(stdout);
 			return false;
 		}
@@ -740,14 +777,14 @@ bool sumTaskWrapper1(
 		const uint64 correspondingRNGStart = (numValidSumEntries - 1)*sizeof(rng);
 		success = SetFileOffset(rngFile, correspondingRNGStart);
 		if (!success) {
-			printf("Failed to set the file offset to %llu in the RNG file \"%s\".", correspondingRNGStart, rngFilename.data());
+			printf("Failed to set the file offset to %llu in the RNG file \"%s\".\n", correspondingRNGStart, rngFilename.data());
 			fflush(stdout);
 			return false;
 		}
 
 		numBytesRead = ReadFile(rngFile, &rng, sizeof(rng));
 		if (numBytesRead != sizeof(rng)) {
-			printf("Failed to read the RNG state from the RNG file \"%s\".", rngFilename.data());
+			printf("Failed to read the RNG state from the RNG file \"%s\".\n", rngFilename.data());
 			fflush(stdout);
 			return false;
 		}
@@ -755,7 +792,7 @@ bool sumTaskWrapper1(
 		const uint64 lastValidRNGEnd = numValidRNGEntries*sizeof(rng);
 		success = SetFileOffset(rngFile, lastValidRNGEnd);
 		if (!success) {
-			printf("Failed to set the file offset to %llu in the RNG file \"%s\".", lastValidRNGEnd, rngFilename.data());
+			printf("Failed to set the file offset to %llu in the RNG file \"%s\".\n", lastValidRNGEnd, rngFilename.data());
 			fflush(stdout);
 			return false;
 		}
@@ -772,7 +809,8 @@ bool sumTaskWrapper1(
 	uint64 startItem = (sequenceOffset%ITEMS_PER_TASK)%ITEMS_PER_BLOCK;
 	printf("Start task: %llu\nStart block: %llu\nStart item: %llu\n", task, startBlock, startItem);
 	fflush(stdout);
-	do {
+	bool keepLooping = !(sequenceOffset > sequenceInfo.sequenceLimit);
+	while (keepLooping) {
 		for (uint64 blocki = startBlock; blocki < BLOCKS_PER_TASK; ++blocki) {
 			for (uint64 itemi = startItem; itemi < ITEMS_PER_BLOCK; ++itemi) {
 				// Generate array of ITEMS_PER_BLOCK numbers
@@ -808,7 +846,7 @@ bool sumTaskWrapper1(
 					if (shouldReportAfter(sequenceOffset) || ((itemi == ITEMS_PER_BLOCK-1) && (blocki == BLOCKS_PER_TASK-1))) {
 						size_t numBytesWritten = WriteFile(sumFile, &state, sizeof(state));
 						if (numBytesWritten != sizeof(state)) {
-							printf("Failed to write sum file \"%s\".", sumFilename.data());
+							printf("Failed to write sum file \"%s\".\n", sumFilename.data());
 							fflush(stdout);
 							return false;
 						}
@@ -818,7 +856,7 @@ bool sumTaskWrapper1(
 						if (numValidSumEntries > numValidRNGEntries) {
 							numBytesWritten = WriteFile(rngFile, &rng, sizeof(rng));
 							if (numBytesWritten != sizeof(rng)) {
-								printf("Failed to write RNG file \"%s\".", rngFilename.data());
+								printf("Failed to write RNG file \"%s\".\n", rngFilename.data());
 								fflush(stdout);
 								return false;
 							}
@@ -845,7 +883,7 @@ bool sumTaskWrapper1(
 				if (shouldReportAfter(sequenceOffset) || (blocki == BLOCKS_PER_TASK-1)) {
 					size_t numBytesWritten = WriteFile(sumFile, &state, sizeof(state));
 					if (numBytesWritten != sizeof(state)) {
-						printf("Failed to write sum file \"%s\".", sumFilename.data());
+						printf("Failed to write sum file \"%s\".\n", sumFilename.data());
 						fflush(stdout);
 						return false;
 					}
@@ -857,12 +895,25 @@ bool sumTaskWrapper1(
 					if (numValidSumEntries > numValidRNGEntries) {
 						numBytesWritten = WriteFile(rngFile, &rng, sizeof(rng));
 						if (numBytesWritten != sizeof(rng)) {
-							printf("Failed to write RNG file \"%s\".", rngFilename.data());
+							printf("Failed to write RNG file \"%s\".\n", rngFilename.data());
 							fflush(stdout);
 							return false;
 						}
 						FlushFile(rngFile);
 						++numValidRNGEntries;
+					}
+
+					if (sequenceOffset > sequenceInfo.sequenceLimit) {
+						printf("Finished sequence due to limit %llu.\n", sequenceInfo.sequenceLimit);
+						fflush(stdout);
+						keepLooping = false;
+						break;
+					}
+					if (!keepRunning) {
+						printf("Task interrupted.\n");
+						fflush(stdout);
+						keepLooping = false;
+						break;
 					}
 				}
 			}
@@ -870,7 +921,7 @@ bool sumTaskWrapper1(
 		}
 		startBlock = 0;
 		++task;
-	} while (KEEP_LOOPING);
+	}
 
 	return true;
 }
@@ -878,23 +929,24 @@ template<typename STATE_T>
 bool sumTaskWrapper0(
 	const DataType itemDataType,
 	const std::function<void (BigFloat<8>&v)>& inverseCDF,
-	const SequenceInfo& sequenceInfo
+	const SequenceInfo& sequenceInfo,
+	volatile bool& keepRunning
 ) {
 	switch (itemDataType) {
 		case DataType::FLOAT: {
-			return sumTaskWrapper1<STATE_T,float>(inverseCDF, sequenceInfo);
+			return sumTaskWrapper1<STATE_T,float>(inverseCDF, sequenceInfo, keepRunning);
 		}
 		case DataType::FLOAT2: {
-			return sumTaskWrapper1<STATE_T,Vec2f>(inverseCDF, sequenceInfo);
+			return sumTaskWrapper1<STATE_T,Vec2f>(inverseCDF, sequenceInfo, keepRunning);
 		}
 		case DataType::DOUBLE: {
-			return sumTaskWrapper1<STATE_T,double>(inverseCDF, sequenceInfo);
+			return sumTaskWrapper1<STATE_T,double>(inverseCDF, sequenceInfo, keepRunning);
 		}
 		case DataType::DOUBLE2: {
-			return sumTaskWrapper1<STATE_T,Vec2d>(inverseCDF, sequenceInfo);
+			return sumTaskWrapper1<STATE_T,Vec2d>(inverseCDF, sequenceInfo, keepRunning);
 		}
 		case DataType::BIGFLOAT8: {
-			return sumTaskWrapper1<STATE_T,BigFloat<8>>(inverseCDF, sequenceInfo);
+			return sumTaskWrapper1<STATE_T,BigFloat<8>>(inverseCDF, sequenceInfo, keepRunning);
 		}
 	}
 	return false;
@@ -960,7 +1012,192 @@ void testRounding() {
 #endif
 
 
+void runTask(const SequenceInfo& sequenceInfo, volatile bool& keepRunning) {
+	std::function<void (BigFloat<8>&v)> inverseCDF;
+	switch (sequenceInfo.distribution) {
+		case Distribution::UNIFORM: {
+			inverseCDF = [](BigFloat<8>&v) {};
+			break;
+		}
+		case Distribution::UNIFORM2: {
+			inverseCDF = [](BigFloat<8>&v) {
+				v *= v;
+			};
+			break;
+		}
+		case Distribution::UNIFORM3: {
+			inverseCDF = [](BigFloat<8>&v) {
+				v *= (v*v);
+			};
+			break;
+		}
+		case Distribution::UNIFORM4: {
+			inverseCDF = [](BigFloat<8>&v) {
+				v *= v;
+				v *= v;
+			};
+			break;
+		}
+		case Distribution::UNIFORMN2: {
+			inverseCDF = [](BigFloat<8>&v) {
+				v = constants::one<8> / v;
+				v *= v;
+			};
+			break;
+		}
+		case Distribution::UNIFORMN3: {
+			inverseCDF = [](BigFloat<8>&v) {
+				v = constants::one<8> / v;
+				v *= (v*v);
+			};
+			break;
+		}
+		case Distribution::UNIFORMN4: {
+			inverseCDF = [](BigFloat<8>&v) {
+				v = constants::one<8> / v;
+				v *= v;
+				v *= v;
+			};
+			break;
+		}
+		case Distribution::UNIFORM_PN: {
+			inverseCDF = [](BigFloat<8>&v) {
+				v <<= 1;
+				v -= constants::one<8>;
+			};
+			break;
+		}
+		case Distribution::UNIFORM_1_5: {
+			inverseCDF = [](BigFloat<8>&v) {
+				v *= BigFloat<8>(3);
+				v >>= 1;
+			};
+			break;
+		}
+		case Distribution::UNIFORM_PN_1_5: {
+			inverseCDF = [](BigFloat<8>&v) {
+				v <<= 1;
+				v -= constants::one<8>;
+				v *= BigFloat<8>(3);
+				v >>= 1;
+			};
+			break;
+		}
+		case Distribution::NORMAL: {
+			// FIXME: Implement this!!!
+			break;
+		}
+		case Distribution::CAUCHY: {
+			inverseCDF = [](BigFloat<8>&v) {
+				v <<= 1;
+				v -= constants::one<8>;
+				v *= constants::tau<8>;
+				v >>= 2;
+
+				BigFloat<8> s;
+				BigFloat<8> c;
+				s.sin(v);
+				c.cos(v);
+				v = s/c;
+			};
+			break;
+		}
+		case Distribution::LOG_NORMAL: {
+			// FIXME: Implement this!!!
+			break;
+		}
+	}
+
+	bool success = false;
+	if (sequenceInfo.methodDataType == DataType::FLOAT) {
+		switch (sequenceInfo.summationMethod) {
+			case Method::ONE_NUMBER: {
+				success = sumTaskWrapper0<OneNumberState<float>>(sequenceInfo.itemDataType, inverseCDF, sequenceInfo, keepRunning);
+				break;
+			}
+			case Method::KAHAN: {
+				success = sumTaskWrapper0<OrigKahanState<float>>(sequenceInfo.itemDataType, inverseCDF, sequenceInfo, keepRunning);
+				break;
+			}
+			case Method::NEUMAIER: {
+				success = sumTaskWrapper0<NeumaierState<float>>(sequenceInfo.itemDataType, inverseCDF, sequenceInfo, keepRunning);
+				break;
+			}
+			case Method::KLEIN: {
+				success = sumTaskWrapper0<KleinState<float>>(sequenceInfo.itemDataType, inverseCDF, sequenceInfo, keepRunning);
+				break;
+			}
+			case Method::NEW_FULL: {
+				success = sumTaskWrapper0<NewState<float>>(sequenceInfo.itemDataType, inverseCDF, sequenceInfo, keepRunning);
+				break;
+			}
+			case Method::NEW_SIMPLE: {
+				success = sumTaskWrapper0<SimpleNewState<float>>(sequenceInfo.itemDataType, inverseCDF, sequenceInfo, keepRunning);
+				break;
+			}
+			case Method::PAIRWISE: {
+				success = sumTaskWrapper0<PairwiseState<float>>(sequenceInfo.itemDataType, inverseCDF, sequenceInfo, keepRunning);
+				break;
+			}
+			case Method::BLOCK: {
+				success = sumTaskWrapper0<BlockState<float>>(sequenceInfo.itemDataType, inverseCDF, sequenceInfo, keepRunning);
+				break;
+			}
+			case Method::BITS:
+			case Method::BIGFLOAT10: {
+				success = sumTaskWrapper0<BigFloatState<10>>(sequenceInfo.itemDataType, inverseCDF, sequenceInfo, keepRunning);
+				break;
+			}
+		}
+	}
+	else {
+		switch (sequenceInfo.summationMethod) {
+			case Method::ONE_NUMBER: {
+				success = sumTaskWrapper0<OneNumberState<double>>(sequenceInfo.itemDataType, inverseCDF, sequenceInfo, keepRunning);
+				break;
+			}
+			case Method::KAHAN: {
+				success = sumTaskWrapper0<OrigKahanState<double>>(sequenceInfo.itemDataType, inverseCDF, sequenceInfo, keepRunning);
+				break;
+			}
+			case Method::NEUMAIER: {
+				success = sumTaskWrapper0<NeumaierState<double>>(sequenceInfo.itemDataType, inverseCDF, sequenceInfo, keepRunning);
+				break;
+			}
+			case Method::KLEIN: {
+				success = sumTaskWrapper0<KleinState<double>>(sequenceInfo.itemDataType, inverseCDF, sequenceInfo, keepRunning);
+				break;
+			}
+			case Method::NEW_FULL: {
+				success = sumTaskWrapper0<NewState<double>>(sequenceInfo.itemDataType, inverseCDF, sequenceInfo, keepRunning);
+				break;
+			}
+			case Method::NEW_SIMPLE: {
+				success = sumTaskWrapper0<SimpleNewState<double>>(sequenceInfo.itemDataType, inverseCDF, sequenceInfo, keepRunning);
+				break;
+			}
+			case Method::PAIRWISE: {
+				success = sumTaskWrapper0<PairwiseState<double>>(sequenceInfo.itemDataType, inverseCDF, sequenceInfo, keepRunning);
+				break;
+			}
+			case Method::BLOCK: {
+				success = sumTaskWrapper0<BlockState<double>>(sequenceInfo.itemDataType, inverseCDF, sequenceInfo, keepRunning);
+				break;
+			}
+			case Method::BITS:
+			case Method::BIGFLOAT10: {
+				success = sumTaskWrapper0<BigFloatState<10>>(sequenceInfo.itemDataType, inverseCDF, sequenceInfo, keepRunning);
+				break;
+			}
+		}
+	}
+
+	//return success ? 0 : -1;
+}
+
+
 int main(int argc,char** argv) {
+
 
 	//testRounding();
 	//return 0;
@@ -974,6 +1211,7 @@ int main(int argc,char** argv) {
 	// Argument 3 is the method data type. (float, double)
 	// Argument 4 is the data to sum type name. (float, double, double2, BigFloat8)
 	// Argument 5 is the data distribution name.
+	// Argument 6 is the sequence limit
 	//
 	// Examples:
 	// Summation.exe OneNumber 0 double double Uniform2
@@ -995,6 +1233,7 @@ int main(int argc,char** argv) {
 	const char*const summationMethodName = argv[1];
 
 	uint64 sequenceNumber;
+	uint64 sequenceNumberEnd;
 	if (argv[2][0] == '*' && argv[2][1] == 0 && strcmp(summationMethodName,"RNG") != 0) {
 		// "*" is an indication to analyse all output data for actual methods
 		sequenceNumber = std::numeric_limits<uint64>::max();
@@ -1003,6 +1242,30 @@ int main(int argc,char** argv) {
 		size_t numCharsInSeqNumber = text::textToInteger<16,true,false>((const char*)argv[2], (const char*)nullptr, sequenceNumber);
 		if (numCharsInSeqNumber == 0) {
 			printf("Command line argument 2 is not a valid hexadecimal integer.");
+			fflush(stdout);
+			return -1;
+		}
+		sequenceNumberEnd = sequenceNumber+1;
+		if (argv[2][numCharsInSeqNumber] == '-') {
+			numCharsInSeqNumber = text::textToInteger<16,true,false>((const char*)argv[2] + numCharsInSeqNumber+1, (const char*)nullptr, sequenceNumberEnd);
+			if (numCharsInSeqNumber == 0) {
+				printf("Command line argument 2, range end is not a valid hexadecimal integer.");
+				fflush(stdout);
+				return -1;
+			}
+		}
+		else if (argv[2][numCharsInSeqNumber] != 0) {
+			printf("Command line argument 2 is not a valid hexadecimal integer.");
+			fflush(stdout);
+			return -1;
+		}
+	}
+
+	uint64 sequenceLimit = 0;
+	if (argc >= 7) {
+		size_t numCharsInSeqLimit = text::textToInteger<10,true,false>((const char*)argv[6], (const char*)nullptr, sequenceLimit);
+		if (numCharsInSeqLimit == 0) {
+			printf("Command line argument 6 is not a valid decimal integer.");
 			fflush(stdout);
 			return -1;
 		}
@@ -1044,35 +1307,6 @@ int main(int argc,char** argv) {
 	const char*const methodDataTypeName = argv[3];
 	const char*const itemDataTypeName = argv[4];
 	const char*const distributionName = argv[5];
-
-	enum class Method {
-		ONE_NUMBER,
-		KAHAN,
-		NEUMAIER,
-		KLEIN,
-		NEW_FULL,
-		NEW_SIMPLE,
-		PAIRWISE,
-		BLOCK,
-		BITS,
-		BIGFLOAT10
-	};
-	// FIXME: Figure out what the distribution is for contributions proportional to 1/d^2 in unit disk!!!
-	enum class Distribution {
-		UNIFORM,    // [0,1]
-		UNIFORM2,   // [0,1]^2
-		UNIFORM3,   // [0,1]^3
-		UNIFORM4,   // [0,1]^4
-		UNIFORMN2,  // [0,1]^(-2)
-		UNIFORMN3,  // [0,1]^(-3)
-		UNIFORMN4,  // [0,1]^(-4)
-		UNIFORM_PN, // [-1,1]
-		UNIFORM_1_5,// [0,1.5]
-		UNIFORM_PN_1_5,// [-1.5,1.5]
-		NORMAL,     // Normal(0,1)
-		CAUCHY,     // Chauchy(0,1)
-		LOG_NORMAL  // LogNormal(1,1)
-	};
 
 	Method method;
 	size_t numBits = 0;
@@ -1267,97 +1501,73 @@ int main(int argc,char** argv) {
 		return -1;
 	}
 
+#if 0
 	SequenceInfo sequenceInfo;
 	sequenceInfo.sequenceNumber = sequenceNumber;
 	sequenceInfo.summationMethodName = summationMethodName;
+	sequenceInfo.summationMethod = method;
 	sequenceInfo.methodDataTypeName = methodDataTypeName;
+	sequenceInfo.methodDataType = methodDataType;
 	sequenceInfo.itemDataTypeName = itemDataTypeName;
+	sequenceInfo.itemDataType = itemDataType;
 	sequenceInfo.distributionName = distributionName;
+	sequenceInfo.distribution = distribution;
 	sequenceInfo.numBits = numBits;
+	sequenceInfo.sequenceLimit = sequenceLimit;
+#else
+	const size_t numTasks = sequenceNumberEnd - sequenceNumber;
+	Array<SequenceInfo> tasks;
+	tasks.setSize(numTasks);
 
-	bool success = false;
-	if (methodDataType == DataType::FLOAT) {
-		switch (method) {
-			case Method::ONE_NUMBER: {
-				success = sumTaskWrapper0<OneNumberState<float>>(itemDataType, inverseCDF, sequenceInfo);
-				break;
-			}
-			case Method::KAHAN: {
-				success = sumTaskWrapper0<OrigKahanState<float>>(itemDataType, inverseCDF, sequenceInfo);
-				break;
-			}
-			case Method::NEUMAIER: {
-				success = sumTaskWrapper0<NeumaierState<float>>(itemDataType, inverseCDF, sequenceInfo);
-				break;
-			}
-			case Method::KLEIN: {
-				success = sumTaskWrapper0<KleinState<float>>(itemDataType, inverseCDF, sequenceInfo);
-				break;
-			}
-			case Method::NEW_FULL: {
-				success = sumTaskWrapper0<NewState<float>>(itemDataType, inverseCDF, sequenceInfo);
-				break;
-			}
-			case Method::NEW_SIMPLE: {
-				success = sumTaskWrapper0<SimpleNewState<float>>(itemDataType, inverseCDF, sequenceInfo);
-				break;
-			}
-			case Method::PAIRWISE: {
-				success = sumTaskWrapper0<PairwiseState<float>>(itemDataType, inverseCDF, sequenceInfo);
-				break;
-			}
-			case Method::BLOCK: {
-				success = sumTaskWrapper0<BlockState<float>>(itemDataType, inverseCDF, sequenceInfo);
-				break;
-			}
-			case Method::BITS:
-			case Method::BIGFLOAT10: {
-				success = sumTaskWrapper0<BigFloatState<10>>(itemDataType, inverseCDF, sequenceInfo);
-				break;
-			}
-		}
-	}
-	else {
-		switch (method) {
-			case Method::ONE_NUMBER: {
-				success = sumTaskWrapper0<OneNumberState<double>>(itemDataType, inverseCDF, sequenceInfo);
-				break;
-			}
-			case Method::KAHAN: {
-				success = sumTaskWrapper0<OrigKahanState<double>>(itemDataType, inverseCDF, sequenceInfo);
-				break;
-			}
-			case Method::NEUMAIER: {
-				success = sumTaskWrapper0<NeumaierState<double>>(itemDataType, inverseCDF, sequenceInfo);
-				break;
-			}
-			case Method::KLEIN: {
-				success = sumTaskWrapper0<KleinState<double>>(itemDataType, inverseCDF, sequenceInfo);
-				break;
-			}
-			case Method::NEW_FULL: {
-				success = sumTaskWrapper0<NewState<double>>(itemDataType, inverseCDF, sequenceInfo);
-				break;
-			}
-			case Method::NEW_SIMPLE: {
-				success = sumTaskWrapper0<SimpleNewState<double>>(itemDataType, inverseCDF, sequenceInfo);
-				break;
-			}
-			case Method::PAIRWISE: {
-				success = sumTaskWrapper0<PairwiseState<double>>(itemDataType, inverseCDF, sequenceInfo);
-				break;
-			}
-			case Method::BLOCK: {
-				success = sumTaskWrapper0<BlockState<double>>(itemDataType, inverseCDF, sequenceInfo);
-				break;
-			}
-			case Method::BITS:
-			case Method::BIGFLOAT10: {
-				success = sumTaskWrapper0<BigFloatState<10>>(itemDataType, inverseCDF, sequenceInfo);
-				break;
-			}
-		}
+	for (size_t taski = 0; taski < numTasks; ++taski) {
+		SequenceInfo& sequenceInfo = tasks[taski];
+		sequenceInfo.sequenceNumber = sequenceNumber + taski;
+		sequenceInfo.summationMethodName = summationMethodName;
+		sequenceInfo.summationMethod = method;
+		sequenceInfo.methodDataTypeName = methodDataTypeName;
+		sequenceInfo.methodDataType = methodDataType;
+		sequenceInfo.itemDataTypeName = itemDataTypeName;
+		sequenceInfo.itemDataType = itemDataType;
+		sequenceInfo.distributionName = distributionName;
+		sequenceInfo.distribution = distribution;
+		sequenceInfo.numBits = numBits;
+		sequenceInfo.sequenceLimit = sequenceLimit;
 	}
 
-	return success ? 0 : -1;
+	const size_t maxThreads = std::thread::hardware_concurrency();
+	const size_t numThreads = (numTasks < maxThreads) ? numTasks : maxThreads;
+	Array<std::unique_ptr<std::thread>> threads;
+	threads.setSize(numThreads);
+	volatile bool keepRunning = true;
+	volatile std::atomic<uint64> taskIndex(0);
+	for (size_t i = 0; i < numThreads; ++i) {
+		threads[i].reset(new std::thread([&keepRunning,&taskIndex,numTasks,&tasks](size_t threadNum) {
+			while (keepRunning) {
+				uint64 task = taskIndex.fetch_add(1);
+				if (task >= numTasks) {
+					break;
+				}
+
+				runTask(tasks[task], keepRunning);
+			}
+		}, i));
+	}
+	std::thread keyThread([&keepRunning]() {
+		getc(stdin);
+		keepRunning = false;
+	});
+	for (size_t i = 0; i < numThreads; ++i) {
+		threads[i]->join();
+	}
+	threads.setCapacity(0);
+
+	if (keepRunning) {
+		printf("Press any key to finish the program.\n");
+		fflush(stdout);
+		keyThread.join();
+	}
+
+	return 0;
+#endif
+
 }
