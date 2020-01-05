@@ -3,6 +3,7 @@
 #include <Array.h>
 #include <ArrayDef.h>
 #include <File.h>
+#include <math/NelderMead.h>
 #include <math/KahanSum.h>
 #include <text/NumberText.h>
 #include <BigFloat.h>
@@ -10,6 +11,10 @@
 #include <algorithm>
 #include <atomic>
 #include <functional>
+#ifdef _WIN32
+#define _USE_MATH_DEFINES
+#endif
+#include <math.h>
 #include <memory>
 #include <string.h>
 #include <thread>
@@ -41,6 +46,7 @@ enum class Method {
 	KLEIN,
 	NEW_FULL,
 	NEW_SIMPLE,
+	NEW_NESTED,
 	PAIRWISE,
 	BLOCK,
 	BITS,
@@ -128,7 +134,7 @@ struct NeumaierState : TupleSumState<T,2> {
 	INLINE void add(T item) {
 		T localSumHigh = sum[0] + item;
 		T localSumLow;
-		if (std::abs(item) >= std::abs(sum[0])) {
+		if (abs(item) >= abs(sum[0])) {
 			localSumLow = sum[0] - (localSumHigh - item);
 		}
 		else {
@@ -146,7 +152,7 @@ struct KleinState : TupleSumState<T,3> {
 	INLINE void add(T item) {
 		T t = sum[0] + item;
 		T c;
-		if (std::abs(sum[0]) >= std::abs(item)) {
+		if (abs(sum[0]) >= abs(item)) {
 			c = (sum[0] - t) + item;
 		}
 		else {
@@ -155,7 +161,7 @@ struct KleinState : TupleSumState<T,3> {
 		sum[0] = t;
 		t = sum[1] + c;
 		T cc;
-		if (std::abs(sum[1]) >= std::abs(c)) {
+		if (abs(sum[1]) >= abs(c)) {
 			cc = (sum[1] - t) + c;
 		}
 		else {
@@ -182,7 +188,7 @@ struct SimpleNewState : TupleSumState<T,2> {
 	INLINE void add(T item) {
 		T localSumHigh = sum[0] + item;
 		T localSumLow;
-		if (std::abs(item) >= std::abs(sum[0])) {
+		if (abs(item) >= abs(sum[0])) {
 			localSumLow = sum[0] - (localSumHigh - item);
 		}
 		else {
@@ -196,6 +202,220 @@ struct SimpleNewState : TupleSumState<T,2> {
 		localSumLow = sum[1] - (localSumHigh - sum[0]);
 		sum[0] = localSumHigh;
 		sum[1] = localSumLow;
+	}
+};
+
+template<typename T>
+struct DoubleFloat;
+
+template<typename T>
+DoubleFloat<T> abs(DoubleFloat<T> x);
+
+template<typename T>
+constexpr INLINE bool isValueZero(const T& x) {
+	return (x == T(0));
+}
+
+template<typename T>
+constexpr INLINE bool isValueZero(const DoubleFloat<T>& x);
+
+template<typename T>
+struct DoubleFloat {
+	T high;
+	T low;
+
+	INLINE DoubleFloat<T>() = default;
+	constexpr INLINE DoubleFloat<T>(const DoubleFloat<T>& that) = default;
+	constexpr INLINE DoubleFloat<T>(T high_, T low_) : high(high_), low(low_) {}
+
+	DoubleFloat<T>& operator+=(const T& that) {
+		T localSumHigh = high + that;
+		T localSumLow;
+		if (abs(that) >= abs(high)) {
+			localSumLow = high - (localSumHigh - that);
+		}
+		else {
+			localSumLow = that - (localSumHigh - high);
+		}
+		high = localSumHigh;
+		low += localSumLow;
+
+		// Add low part back into high part
+		localSumHigh = high + low;
+		localSumLow = low - (localSumHigh - high);
+		high = localSumHigh;
+		low = localSumLow;
+
+		return *this;
+	}
+	INLINE DoubleFloat<T>& operator+=(const DoubleFloat<T>& that) {
+		*this += that.high;
+		if (!isValueZero(that.low)) {
+			*this += that.low;
+		}
+		return *this;
+	}
+	DoubleFloat<T>& operator-=(const T& that) {
+		T localSumHigh = high - that;
+		T localSumLow;
+		if (abs(that) >= abs(high)) {
+			localSumLow = high - (localSumHigh + that);
+		}
+		else {
+			localSumLow = -that - (localSumHigh - high);
+		}
+		high = localSumHigh;
+		low += localSumLow;
+
+		// Add low part back into high part
+		localSumHigh = high + low;
+		localSumLow = low - (localSumHigh - high);
+		high = localSumHigh;
+		low = localSumLow;
+
+		return *this;
+	}
+	INLINE DoubleFloat<T>& operator-=(const DoubleFloat<T>& that) {
+		*this -= that.high;
+		if (!isValueZero(that.low)) {
+			*this -= that.low;
+		}
+		return *this;
+	}
+	constexpr INLINE DoubleFloat<T> operator-() const {
+		return DoubleFloat<T>(-high, -low);
+	}
+	constexpr INLINE DoubleFloat<T> operator+() const {
+		return *this;
+	}
+	DoubleFloat<T> operator+(const T& that) const {
+		T localSumHigh = high + that;
+		T localSumLow;
+		if (abs(that) >= abs(high)) {
+			localSumLow = high - (localSumHigh - that);
+		}
+		else {
+			localSumLow = that - (localSumHigh - high);
+		}
+		T newHigh = localSumHigh;
+		T newLow = low + localSumLow;
+
+		// Add low part back into high part
+		localSumHigh = newHigh + newLow;
+		localSumLow = newLow - (localSumHigh - newHigh);
+		newHigh = localSumHigh;
+		newLow = localSumLow;
+
+		return DoubleFloat<T>(newHigh, newLow);
+	}
+	INLINE DoubleFloat<T> operator+(const DoubleFloat<T>& that) const {
+		DoubleFloat<T> v = (*this + that.high);
+		if (!isValueZero(that.low)) {
+			v += that.low;
+		}
+		return v;
+	}
+	DoubleFloat<T> operator-(const T& that) const {
+		T localSumHigh = high - that;
+		T localSumLow;
+		if (abs(that) >= abs(high)) {
+			localSumLow = high - (localSumHigh + that);
+		}
+		else {
+			localSumLow = -that - (localSumHigh - high);
+		}
+		T newHigh = localSumHigh;
+		T newLow = low + localSumLow;
+
+		// Add low part back into high part
+		localSumHigh = newHigh + newLow;
+		localSumLow = newLow - (localSumHigh - newHigh);
+		newHigh = localSumHigh;
+		newLow = localSumLow;
+
+		return DoubleFloat<T>(newHigh, newLow);
+	}
+	INLINE DoubleFloat<T> operator-(const DoubleFloat<T>& that) const {
+		DoubleFloat<T> v = (*this - that.high);
+		if (!isValueZero(that.low)) {
+			v -= that.low;
+		}
+		return v;
+	}
+	constexpr INLINE bool isNegative() const {
+		// This check is equivalent to low+high < 0 in exact arithmetic,
+		// but avoids the potentially expensive and inexact addition operation.
+		return (-high > low);
+	}
+	constexpr INLINE bool isPositive() const {
+		// This check is equivalent to low+high > 0 in exact arithmetic,
+		// but avoids the potentially expensive and inexact addition operation.
+		return (-high < low);
+	}
+	constexpr INLINE bool isZero() const {
+		// This check is equivalent to low+high == 0 in exact arithmetic,
+		// but avoids the potentially expensive and inexact addition operation.
+		return (-high == low);
+	}
+	constexpr INLINE bool isNonNegative() const {
+		// This check is equivalent to low+high >= 0 in exact arithmetic,
+		// but avoids the potentially expensive and inexact addition operation.
+		return (-high <= low);
+	}
+	constexpr INLINE bool isNonPositive() const {
+		// This check is equivalent to low+high <= 0 in exact arithmetic,
+		// but avoids the potentially expensive and inexact addition operation.
+		return (-high >= low);
+	}
+	INLINE bool operator<(const DoubleFloat<T>& that) const {
+		return (*this - that).isNegative();
+	}
+	INLINE bool operator<=(const DoubleFloat<T>& that) const {
+		return (*this - that).isNonPositive();
+	}
+	INLINE bool operator>(const DoubleFloat<T>& that) const {
+		return (*this - that).isPositive();
+	}
+	INLINE bool operator>=(const DoubleFloat<T>& that) const {
+		return (*this - that).isNonNegative();
+	}
+	INLINE bool operator==(const DoubleFloat<T>& that) const {
+		return (*this - that).isZero();
+	}
+	INLINE bool operator!=(const DoubleFloat<T>& that) const {
+		return !(*this == that);
+	}
+};
+
+template<typename T>
+DoubleFloat<T> abs(DoubleFloat<T> x) {
+	return x.isNegative() ? -x : x;
+}
+
+template<typename T>
+constexpr INLINE bool isValueZero(const DoubleFloat<T>& x) {
+	return x.isZero();
+}
+
+template<typename T>
+struct NestedSimpleNewState {
+	DoubleFloat<DoubleFloat<T>> sum;
+
+	constexpr void reset() {
+		sum.high = DoubleFloat<T>(0,0);
+		sum.low = DoubleFloat<T>(0,0);
+	}
+	template<size_t FN>
+	big_float::BigFloat<FN> asBigFloat() const {
+		// Add from smallest to largest
+		big_float::BigFloat<FN> outSum = big_float::BigFloat<FN>(double(sum.low.low));
+		outSum += big_float::BigFloat<FN>(double(sum.low.high));
+		outSum += big_float::BigFloat<FN>(double(sum.high.low));
+		outSum += big_float::BigFloat<FN>(double(sum.high.high));
+		return outSum;
+	}
+	INLINE void add(T item) {
+		sum += DoubleFloat<T>(item,T(0));
 	}
 };
 
@@ -521,6 +741,141 @@ static void makeSumFilename(
 	memcpy(filenameData, suffix, suffixLength + 1);
 }
 
+// This determines the maximum likelihood parameters mu and sigma for the given data and distribution:
+// f(x) = (1/(sigma*sqrt(tau)))*(exp(-(1/2)*((x-mu)/sigma)^2) + exp(-(1/2)*((x+mu)/sigma)^2)), x >= 0
+// namely, the distribution of the absolute values of normally distributed random variables,
+// which is what we'd expect the absolute errors to be distributed as.
+void maximumLikelihoodAbsNormal(const double* data, const size_t n, double& outputMu, double& outputSigma) {
+	assert(n >= 2);
+	SimpleNewState<double> sum;
+	SimpleNewState<double> sumSquares;
+	sum.reset();
+	sumSquares.reset();
+	double max = data[0];
+	double min = data[0];
+	for (size_t i = 0; i < n; ++i) {
+		const double v = data[i];
+		sum.add(v);
+		sumSquares.add(v*v);
+		if (v > max) {
+			max = v;
+		}
+		else if (v < min) {
+			min = v;
+		}
+	}
+
+	if (min == max) {
+		outputMu = min;
+		outputSigma = 0;
+		return;
+	}
+
+	const BigFloat<10> bigSum = sum.asBigFloat<10>();
+	double mean = double(bigSum)/n;
+	double stddev = sqrt(double(sumSquares.asBigFloat<10>())/n - mean*mean);
+
+
+	// Initial guesses for search:
+	Vec2d searchStates[3] = {
+		{0.0, stddev}, // Underestimate of stddev for case of centre at zero
+		{0.0, max-min},// Overestimate of stddev for case of centre at zero
+		{mean,stddev}  // Close guess for case of centre far from zero
+	};
+
+	auto&& estimator = [data,n](const Vec2d& state) -> double {
+		SimpleNewState<double> sum;
+		sum.reset();
+		const double sigma = (state[1] < 0) ? -state[1] : state[1];
+		for (size_t i = 0; i < n; ++i) {
+			const double pos = (data[i] - state[0])/sigma;
+			const double neg = (data[i] + state[0])/sigma;
+			sum.add(log(exp(-0.5*pos*pos) + exp(-0.5*neg*neg)));
+		}
+		sum.add(-double(n)*log(sigma));
+
+		// Negative is because Nelder-Mead minimizes, and we want to maximize.
+		return -double(sum.asBigFloat<10>());
+	};
+
+	double values[3] = {
+		estimator(searchStates[0]),
+		estimator(searchStates[1]),
+		estimator(searchStates[2])
+	};
+
+	const size_t bestIndex = math::minimizeNelderMead(searchStates, values, 3, 500, -std::numeric_limits<double>::infinity(), estimator);
+
+	outputMu = searchStates[bestIndex][0];
+	outputSigma = searchStates[bestIndex][1];
+	if (outputMu < 0) {
+		outputMu = -outputMu;
+	}
+	if (outputSigma < 0) {
+		outputSigma = -outputSigma;
+	}
+}
+
+void integrateAbsNormal(double mu, double sigma, const double* quantiles, size_t numQuantiles, double* quantileXs) {
+	double minx = mu - 8*sigma;
+	if (!(minx >= 0)) {
+		minx = 0;
+	}
+	double maxx = mu + 8*sigma;
+
+	constexpr size_t numSteps = 16384;
+	const double stepSize = (maxx - minx)/numSteps;
+	constexpr double sqrtTau = 2.506628274631000502415765284811;
+	const double scale = (stepSize/6)/(sigma*sqrtTau);
+
+	SimpleNewState<double> sum;
+	sum.reset();
+
+	auto&& f = [mu,sigma](double x) {
+		const double pos = (x - mu)/sigma;
+		const double neg = (x + mu)/sigma;
+		return exp(-0.5*pos*pos) + exp(-0.5*neg*neg);
+	};
+
+	// Integrate using Simpson's Rule steps.
+	double prevX = minx;
+	double prevValue = f(minx);
+	double prevSum = 0;
+	size_t quantileIndex = 0;
+	for (size_t step = 0; step < numSteps; ++step) {
+		const double midX = minx + (maxx - minx)*(step + 0.5)/numSteps;
+		const double nextX = minx + (maxx - minx)*(step + 1.0)/numSteps;
+		const double midValue = f(midX);
+		const double nextValue = f(nextX);
+
+		const double currentContribution = scale*(prevValue + 4*midValue + nextValue);
+		sum.add(currentContribution);
+		double nextSum = double(sum.asBigFloat<10>());
+
+		while (quantiles[quantileIndex] < nextSum) {
+			if (currentContribution == 0) {
+				quantileXs[quantileIndex] = prevX;
+			}
+			else {
+				quantileXs[quantileIndex] = prevX + stepSize*(quantiles[quantileIndex] - prevSum)/(nextSum - prevSum);
+			}
+			++quantileIndex;
+			if (quantileIndex >= numQuantiles) {
+				return;
+			}
+		}
+
+		prevValue = nextValue;
+		prevSum = nextSum;
+		prevX = nextX;
+	}
+	while (quantileIndex < numQuantiles) {
+		quantileXs[quantileIndex] = maxx;
+		++quantileIndex;
+	}
+}
+
+
 template<typename STATE_T,typename ITEM_T>
 bool analysisSingle(
 	const SequenceInfo& baseSequenceInfo,
@@ -530,23 +885,10 @@ bool analysisSingle(
 	Array<BigFloat<10>>& absDiffs,
 	Array<BigFloat<10>>& relDiffs,
 	FILE* absDiffOutputFile,
-	FILE* relDiffOutputFile
+	FILE* fitOutputFile
 ) {
 	const size_t numSequences = (methodSums.size() < targetSums.size()) ? methodSums.size() : targetSums.size();
 	assert(numSequences > 0);
-
-	absDiffs.setSize(numSequences);
-	relDiffs.setSize(numSequences);
-	for (size_t i = 0; i < numSequences; ++i) {
-		absDiffs[i] = methodSums[i] - targetSums[i];
-		absDiffs[i].negative = false;
-		BigFloat<10> magnitude = targetSums[i];
-		magnitude.negative = false;
-		relDiffs[i] = absDiffs[i] / magnitude;
-	}
-	std::sort(absDiffs.begin(), absDiffs.end());
-	std::sort(relDiffs.begin(), relDiffs.end());
-	std::sort(targetSums.begin(), targetSums.end());
 
 	constexpr size_t numPercentiles = 11;
 	constexpr double percentiles[numPercentiles] = {
@@ -565,10 +907,24 @@ bool analysisSingle(
 
 	if (sequenceOffset == 1) {
 		fprintf(absDiffOutputFile, "seqOff\tnumSeq\tmin\t1%%\t5%%\t10%%\t25%%\t50%%\t75%%\t90%%\t95%%\t99%%\tmax\n");
-		fprintf(relDiffOutputFile, "seqOff\tnumSeq\tmin\t1%%\t5%%\t10%%\t25%%\t50%%\t75%%\t90%%\t95%%\t99%%\tmax\n");
+		fprintf(fitOutputFile, "seqOff\tnumSeq\tmin\t1%%\t5%%\t10%%\t25%%\t50%%\t75%%\t90%%\t95%%\t99%%\tmax\n");
 	}
 	fprintf(absDiffOutputFile, "%llu\t%llu", (unsigned long long)sequenceOffset, (unsigned long long)numSequences);
-	fprintf(relDiffOutputFile, "%llu\t%llu", (unsigned long long)sequenceOffset, (unsigned long long)numSequences);
+	fprintf(fitOutputFile, "%llu\t%llu", (unsigned long long)sequenceOffset, (unsigned long long)numSequences);
+
+//#if 1
+	absDiffs.setSize(numSequences);
+	//relDiffs.setSize(numSequences);
+	for (size_t i = 0; i < numSequences; ++i) {
+		absDiffs[i] = methodSums[i] - targetSums[i];
+		absDiffs[i].negative = false;
+		//BigFloat<10> magnitude = targetSums[i];
+		//magnitude.negative = false;
+		//relDiffs[i] = absDiffs[i] / magnitude;
+	}
+	std::sort(absDiffs.begin(), absDiffs.end());
+	//std::sort(relDiffs.begin(), relDiffs.end());
+	//std::sort(targetSums.begin(), targetSums.end());
 
 	for (size_t percentilei = 0; percentilei < numPercentiles; ++percentilei) {
 		double t = (numSequences-1)*percentiles[percentilei];
@@ -581,14 +937,36 @@ bool analysisSingle(
 		}
 
 		double absDiff = double(absDiffs[index0]) + t*double(absDiffs[index1]-absDiffs[index0]);
-		double relDiff = double(relDiffs[index0]) + t*double(relDiffs[index1]-relDiffs[index0]);
-		double targetSum = double(targetSums[index0]) + t*double(targetSums[index1]-targetSums[index0]);
+		//double relDiff = double(relDiffs[index0]) + t*double(relDiffs[index1]-relDiffs[index0]);
+		//double targetSum = double(targetSums[index0]) + t*double(targetSums[index1]-targetSums[index0]);
 
 		fprintf(absDiffOutputFile, "\t%e", absDiff);
-		fprintf(relDiffOutputFile, "\t%e", relDiff);
+		//fprintf(relDiffOutputFile, "\t%e", relDiff);
 	}
+//#else
+	Array<double> absDiffsD;
+	absDiffsD.setSize(numSequences);
+	for (size_t i = 0; i < numSequences; ++i) {
+#if 0
+		absDiffsD[i] = double(methodSums[i] - targetSums[i]);
+		if (absDiffsD[i] < 0) {
+			absDiffsD[i] = -absDiffsD[i];
+		}
+#endif
+		absDiffsD[i] = double(absDiffs[i]);
+	}
+	double mu;
+	double sigma;
+	maximumLikelihoodAbsNormal(absDiffsD.data(), numSequences, mu, sigma);
+	double percentileXs[numPercentiles];
+	integrateAbsNormal(mu, sigma, percentiles, numPercentiles, percentileXs);
+	for (size_t percentilei = 0; percentilei < numPercentiles; ++percentilei) {
+		fprintf(fitOutputFile, "\t%e", percentileXs[percentilei]);
+	}
+//#endif
+
 	fprintf(absDiffOutputFile, "\n");
-	fprintf(relDiffOutputFile, "\n");
+	fprintf(fitOutputFile, "\n");
 
 	return true;
 }
@@ -603,9 +981,9 @@ bool analysis(const SequenceInfo& baseSequenceInfo) {
 		fflush(stdout);
 		return false;
 	}
-	makeSumFilename(filename, baseSequenceInfo, "_RelDiff.txt");
-	FILE* relDiffOutputFile = fopen(filename.data(), "wb");
-	if (relDiffOutputFile == nullptr) {
+	makeSumFilename(filename, baseSequenceInfo, "_FitDiff.txt");
+	FILE* fitOutputFile = fopen(filename.data(), "wb");
+	if (fitOutputFile == nullptr) {
 		fclose(absDiffOutputFile);
 		printf("Unable to create file \"%s\" for writing.", filename.data());
 		fflush(stdout);
@@ -684,16 +1062,16 @@ bool analysis(const SequenceInfo& baseSequenceInfo) {
 		bool success = analysisSingle<STATE_T,ITEM_T>(
 			baseSequenceInfo, fileEntryToEndOffset(resulti),
 			methodSamples, targetSamples, absDiffs, relDiffs,
-			absDiffOutputFile, relDiffOutputFile);
+			absDiffOutputFile, fitOutputFile);
 		if (!success) {
 			fclose(absDiffOutputFile);
-			fclose(relDiffOutputFile);
+			fclose(fitOutputFile);
 			return false;
 		}
 	}
 
 	fclose(absDiffOutputFile);
-	fclose(relDiffOutputFile);
+	fclose(fitOutputFile);
 
 	return true;
 }
@@ -1135,6 +1513,10 @@ void runTask(const SequenceInfo& sequenceInfo, volatile bool& keepRunning) {
 				success = sumTaskWrapper0<SimpleNewState<float>>(sequenceInfo.itemDataType, inverseCDF, sequenceInfo, keepRunning);
 				break;
 			}
+			case Method::NEW_NESTED: {
+				success = sumTaskWrapper0<NestedSimpleNewState<float>>(sequenceInfo.itemDataType, inverseCDF, sequenceInfo, keepRunning);
+				break;
+			}
 			case Method::PAIRWISE: {
 				success = sumTaskWrapper0<PairwiseState<float>>(sequenceInfo.itemDataType, inverseCDF, sequenceInfo, keepRunning);
 				break;
@@ -1176,6 +1558,10 @@ void runTask(const SequenceInfo& sequenceInfo, volatile bool& keepRunning) {
 				success = sumTaskWrapper0<SimpleNewState<double>>(sequenceInfo.itemDataType, inverseCDF, sequenceInfo, keepRunning);
 				break;
 			}
+			case Method::NEW_NESTED: {
+				success = sumTaskWrapper0<NestedSimpleNewState<double>>(sequenceInfo.itemDataType, inverseCDF, sequenceInfo, keepRunning);
+				break;
+			}
 			case Method::PAIRWISE: {
 				success = sumTaskWrapper0<PairwiseState<double>>(sequenceInfo.itemDataType, inverseCDF, sequenceInfo, keepRunning);
 				break;
@@ -1197,7 +1583,6 @@ void runTask(const SequenceInfo& sequenceInfo, volatile bool& keepRunning) {
 
 
 int main(int argc,char** argv) {
-
 
 	//testRounding();
 	//return 0;
@@ -1237,6 +1622,7 @@ int main(int argc,char** argv) {
 	if (argv[2][0] == '*' && argv[2][1] == 0 && strcmp(summationMethodName,"RNG") != 0) {
 		// "*" is an indication to analyse all output data for actual methods
 		sequenceNumber = std::numeric_limits<uint64>::max();
+		sequenceNumberEnd = std::numeric_limits<uint64>::max();
 	}
 	else {
 		size_t numCharsInSeqNumber = text::textToInteger<16,true,false>((const char*)argv[2], (const char*)nullptr, sequenceNumber);
@@ -1328,6 +1714,9 @@ int main(int argc,char** argv) {
 	else if (strcmp(summationMethodName,"NewSimple") == 0) {
 		method = Method::NEW_SIMPLE;
 	}
+	else if (strcmp(summationMethodName,"NewNested") == 0) {
+		method = Method::NEW_NESTED;
+	}
 	else if (strcmp(summationMethodName,"Pairwise") == 0) {
 		method = Method::PAIRWISE;
 	}
@@ -1403,97 +1792,44 @@ int main(int argc,char** argv) {
 	}
 
 	Distribution distribution;
-	std::function<void (BigFloat<8>&v)> inverseCDF;
 	if (strcmp(distributionName,"Uniform") == 0) {
 		distribution = Distribution::UNIFORM;
-		inverseCDF = [](BigFloat<8>&v) {};
 	}
 	else if (strcmp(distributionName,"Uniform2") == 0) {
 		distribution = Distribution::UNIFORM2;
-		inverseCDF = [](BigFloat<8>&v) {
-			v *= v;
-		};
 	}
 	else if (strcmp(distributionName,"Uniform3") == 0) {
 		distribution = Distribution::UNIFORM3;
-		inverseCDF = [](BigFloat<8>&v) {
-			v *= (v*v);
-		};
 	}
 	else if (strcmp(distributionName,"Uniform4") == 0) {
 		distribution = Distribution::UNIFORM4;
-		inverseCDF = [](BigFloat<8>&v) {
-			v *= v;
-			v *= v;
-		};
 	}
 	else if (strcmp(distributionName,"UniformN2") == 0) {
 		distribution = Distribution::UNIFORMN2;
-		inverseCDF = [](BigFloat<8>&v) {
-			v = constants::one<8> / v;
-			v *= v;
-		};
 	}
 	else if (strcmp(distributionName,"UniformN3") == 0) {
 		distribution = Distribution::UNIFORMN3;
-		inverseCDF = [](BigFloat<8>&v) {
-			v = constants::one<8> / v;
-			v *= (v*v);
-		};
 	}
 	else if (strcmp(distributionName,"UniformN4") == 0) {
 		distribution = Distribution::UNIFORMN4;
-		inverseCDF = [](BigFloat<8>&v) {
-			v = constants::one<8> / v;
-			v *= v;
-			v *= v;
-		};
 	}
 	else if (strcmp(distributionName,"Uniform_PN") == 0) {
 		distribution = Distribution::UNIFORM_PN;
-		inverseCDF = [](BigFloat<8>&v) {
-			v <<= 1;
-			v -= constants::one<8>;
-		};
 	}
 	else if (strcmp(distributionName,"Uniform_1_5") == 0) {
 		distribution = Distribution::UNIFORM_1_5;
-		inverseCDF = [](BigFloat<8>&v) {
-			v *= BigFloat<8>(3);
-			v >>= 1;
-		};
 	}
 	else if (strcmp(distributionName,"Uniform_PN_1_5") == 0) {
 		distribution = Distribution::UNIFORM_PN_1_5;
-		inverseCDF = [](BigFloat<8>&v) {
-			v <<= 1;
-			v -= constants::one<8>;
-			v *= BigFloat<8>(3);
-			v >>= 1;
-		};
 	}
 	else if (strcmp(distributionName,"Normal") == 0) {
 		distribution = Distribution::NORMAL;
-		// FIXME: Implement this!!!
 	}
 	else if (strcmp(distributionName,"Cauchy") == 0) {
 		distribution = Distribution::CAUCHY;
-		inverseCDF = [](BigFloat<8>&v) {
-			v <<= 1;
-			v -= constants::one<8>;
-			v *= constants::tau<8>;
-			v >>= 2;
-
-			BigFloat<8> s;
-			BigFloat<8> c;
-			s.sin(v);
-			c.cos(v);
-			v = s/c;
-		};
 	}
 	else if (strcmp(distributionName,"LogNormal") == 0) {
 		distribution = Distribution::LOG_NORMAL;
-		// FIXME: Implement this!!!
 	}
 	else {
 		printf("Unsupported distribution \"%s\"!", distributionName);
@@ -1501,21 +1837,7 @@ int main(int argc,char** argv) {
 		return -1;
 	}
 
-#if 0
-	SequenceInfo sequenceInfo;
-	sequenceInfo.sequenceNumber = sequenceNumber;
-	sequenceInfo.summationMethodName = summationMethodName;
-	sequenceInfo.summationMethod = method;
-	sequenceInfo.methodDataTypeName = methodDataTypeName;
-	sequenceInfo.methodDataType = methodDataType;
-	sequenceInfo.itemDataTypeName = itemDataTypeName;
-	sequenceInfo.itemDataType = itemDataType;
-	sequenceInfo.distributionName = distributionName;
-	sequenceInfo.distribution = distribution;
-	sequenceInfo.numBits = numBits;
-	sequenceInfo.sequenceLimit = sequenceLimit;
-#else
-	const size_t numTasks = sequenceNumberEnd - sequenceNumber;
+	const size_t numTasks = (sequenceNumber == std::numeric_limits<uint64>::max()) ? 1 : (sequenceNumberEnd - sequenceNumber);
 	Array<SequenceInfo> tasks;
 	tasks.setSize(numTasks);
 
@@ -1552,22 +1874,27 @@ int main(int argc,char** argv) {
 			}
 		}, i));
 	}
-	std::thread keyThread([&keepRunning]() {
-		getc(stdin);
-		keepRunning = false;
-	});
+	std::thread keyThread;
+	if (sequenceNumber != std::numeric_limits<uint64>::max()) {
+		keyThread = std::thread([&keepRunning]() {
+			getc(stdin);
+			keepRunning = false;
+		});
+	}
 	for (size_t i = 0; i < numThreads; ++i) {
 		threads[i]->join();
 	}
 	threads.setCapacity(0);
 
-	if (keepRunning) {
-		printf("Press any key to finish the program.\n");
+	if ((sequenceNumber != std::numeric_limits<uint64>::max()) && keepRunning) {
+		printf("Press Enter to finish the program if it doesn't exit.\n");
 		fflush(stdout);
-		keyThread.join();
+		//keyThread.join();
+	}
+	else {
+		printf("Analysis complete.\n");
+		fflush(stdout);
 	}
 
 	return 0;
-#endif
-
 }
